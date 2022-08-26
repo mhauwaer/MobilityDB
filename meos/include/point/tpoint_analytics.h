@@ -36,6 +36,7 @@
 
 /* PostgreSQL */
 #include <postgres.h>
+#include <utils/array.h>
 /* MobilityDB */
 #include "general/temporaltypes.h"
 
@@ -52,6 +53,13 @@ extern bool tpoint_to_geo_measure(const Temporal *tpoint,
 
 extern Temporal *temporal_simplify(const Temporal *temp, bool synchronized,
   double eps_dist);
+
+/* Segmentation */
+
+extern ArrayType *temporal_segmentation_sws_threshold(const Temporal *temp, double threshold, unsigned int windows_length, char kernel);
+extern ArrayType *temporal_segmentation_sws_percentile(const Temporal *temp, double percentile, unsigned int windows_length, char kernel);
+
+extern ArrayType *temporal_segmentation_stable_criteria(const Temporal *temp, char *criteria);
 
 /* Transform the temporal point to Mapbox Vector Tile format */
 

@@ -86,6 +86,28 @@ LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
 /*****************************************************************************/
 
+CREATE FUNCTION segment_by_sws_t(tgeompoint, float8, int, char)
+RETURNS tgeompoint[]
+AS 'MODULE_PATHNAME', 'Tpoint_segmentation_sws_t'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION segment_by_sws_p(tgeompoint, float8, int, char)
+    RETURNS tgeompoint[]
+AS 'MODULE_PATHNAME', 'Tpoint_segmentation_sws_p'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION segment_by_stable_criteria(tgeompoint, text)
+    RETURNS tgeompoint[]
+AS 'MODULE_PATHNAME', 'Tpoint_segmentation_stable_criteria'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION segment_by_stop_points(tgeompoint, float8, float8)
+    RETURNS tgeompoint[]
+AS 'MODULE_PATHNAME', 'Tpoint_segmentation_stop_points'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+/*****************************************************************************/
+
 CREATE FUNCTION simplify(tfloat, float8)
 RETURNS tfloat
 AS 'MODULE_PATHNAME', 'Tfloat_simplify'

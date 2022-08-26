@@ -37,6 +37,7 @@
 #include <assert.h>
 #include <float.h>
 #include <math.h>
+#include <limits.h>
 /* PostgreSQL */
 // #include <utils/float.h>
 // #include <utils/timestamp.h>
@@ -1143,6 +1144,1966 @@ temporal_simplify(const Temporal *temp, bool synchronized, double eps_dist)
       synchronized, eps_dist, 2);
   return result;
 }
+
+extern ArrayType *temporalarr_to_array(const Temporal **temporal, int count);
+
+/**
+ * Convert radians to degrees.
+ * @param radian The radian
+ * @return The degree
+ */
+double to_degrees(double radian) {
+  return  radian * 180.0/M_PI;
+}
+
+/**
+ * Convert degrees to radians.
+ * @param degree The degree
+ * @return The radian
+ */
+double to_radians(double degree) {
+  return degree * M_PI/180;
+}
+
+/**
+ * Compute the bearing from the first point to the second on a sphere.
+ * @param p1 The first point
+ * @param p2 The second point
+ * @return The bearing
+ */
+double bearing(POINT2D p1, POINT2D p2) {
+  double lon1 = p1.x, lat1 = p1.y, lon2 = p2.x, lat2 = p2.y;
+
+  lon1 = to_radians(lon1);
+  lat1 = to_radians(lat1);
+  lon2 = to_radians(lon2);
+  lat2 = to_radians(lat2);
+
+  double x = sin(lon2-lon1) * cos(lat2);
+  double y = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(lon2-lon1);
+
+  double b = atan2(y, x);
+
+  return fmod(to_degrees(b) + 360, 360);
+}
+
+/**
+ * Compute the shortest distance between two points on a sphere.
+ * @param p1 The first point
+ * @param p2 The second point
+ * @return The distance
+ */
+double haversine_distance(POINT2D p1, POINT2D p2) {
+
+  double lon1 = p1.x, lat1 = p1.y, lon2 = p2.x, lat2 = p2.y;
+  // convert decimal degrees to radians
+  lon1 = to_radians(lon1);
+  lat1 = to_radians(lat1);
+  lon2 = to_radians(lon2);
+  lat2 = to_radians(lat2);
+
+  // haversine formula
+  double delta_lon = lon2 - lon1;
+  double delta_lat = lat2 - lat1;
+  double a = pow(sin(delta_lat / 2.0), 2) + cos(lat1) * cos(lat2) * pow(sin(delta_lon / 2.0), 2);
+  double c = 2 * asin(sqrt(a));
+
+  double earth_radius = 6378137.0;  //# Meters
+  return c * earth_radius;
+}
+
+/**
+ * Compute the point located in the middle of a great circle path between two points on a sphere.
+ * @param p1 The first point
+ * @param p2 The second point
+ * @return The computed point
+ */
+POINT2D midpoint(POINT2D p1, POINT2D p2) {
+  double lon1 = p1.x, lat1 = p1.y, lon2 = p2.x, lat2 = p2.y;
+  lon1 = to_radians(lon1);
+  lat1 = to_radians(lat1);
+  lon2 = to_radians(lon2);
+  lat2 = to_radians(lat2);
+
+  double bx = cos(lat2) * cos(lon2 - lon1);
+  double by = cos(lat2) * sin(lon2 - lon1);
+
+
+  double lat3 = atan2(sin(lat1) + sin(lat2), sqrt(pow(cos(lat1) + bx, 2) + pow(by,2)));
+  double lon3 = lon1 + atan2(by, cos(lat1) + bx);
+
+  POINT2D point = {.x=to_degrees(lon3), .y=to_degrees(lat3)};
+
+  return point;
+}
+
+/**
+ * Compute the linear regression extrapolation.
+ * @param trajectory The trajectory
+ * @param i The index of the point in the middle of the window
+ * @param mid The length of the window divided by two
+ * @param point The point obtained from the extrapolation
+ * @param t The time of the point in the middle of the window
+ */
+void
+linear_regression_extrapolation(const TSequence *trajectory, int i, int mid, POINT2D *point, int t) {
+  double sumx=0, sumx2=0, sumy=0, sumxy=0;
+
+  for (int j=i; j < i+mid; j++) {
+      double x = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, j))).x;
+      int y = tsequence_inst_n(trajectory, j)->t;
+      sumx += x;
+      sumx2 += pow(x, 2);
+      sumy += y;
+      sumxy += x * y;
+  }
+  double b = (mid*sumxy-sumx*sumy)/(mid*sumx2-sumx*sumx);
+  double a = (sumy - b*sumx)/mid;
+
+  point->x = a + b * t;
+
+  sumx=0, sumx2=0, sumy=0, sumxy=0;
+
+  for (int j=i; j < i+mid; j++) {
+      double x = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, j))).y;
+      int y = tsequence_inst_n(trajectory, j)->t;
+      sumx += x;
+      sumx2 += pow(x, 2);
+      sumy += y;
+      sumxy += x * y;
+  }
+  b = (mid*sumxy-sumx*sumy)/(mid*sumx2-sumx*sumx);
+  a = (sumy - b*sumx)/mid;
+
+  point->y = a + b * t;
+}
+
+/**
+ * Compute the forward and backward linear regression extrapolation.
+ * @param trajectory The trajectory
+ * @param i The index of the point in the middle of the window
+ * @param mid The length of the window divided by two
+ * @param PF The point obtained from the forward extrapolation
+ * @param PB The point obtained from the backward extrapolation
+ */
+void
+linear_regression_interpolation(const TSequence *trajectory, int i, int mid, POINT2D *PF, POINT2D *PB) {
+    linear_regression_extrapolation(trajectory, i-mid, mid, PF, tsequence_inst_n(trajectory, i)->t);
+    linear_regression_extrapolation(trajectory, i+1, mid, PB, tsequence_inst_n(trajectory, i)->t);
+}
+
+/**
+ * Compute the forward and backward kinematic extrapolation.
+ * @param trajectory The trajectory
+ * @param i The index of the point in the middle of the window
+ * @param PF The point obtained from the forward extrapolation
+ * @param PB The point obtained from the backward extrapolation
+ */
+void
+kinematic_interpolation(const TSequence *trajectory, int i, POINT2D *PF, POINT2D *PB) {
+    POINT2D p_0 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i-3))), p_1 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i-2))), p_2 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i-1)));
+    int t_0 = tsequence_inst_n(trajectory, i-3)->t, t_1 = tsequence_inst_n(trajectory, i-2)->t, t_2 = tsequence_inst_n(trajectory, i-1)->t, t_i = tsequence_inst_n(trajectory, i)->t;
+    double v_x_1 = (p_1.x - p_0.x)/(t_1 - t_0), v_x_2 = (p_2.x - p_1.x)/(t_2 - t_1);
+    double v_y_1 = (p_1.y - p_0.y)/(t_1 - t_0), v_y_2 = (p_2.y - p_1.y)/(t_2 - t_1);
+    double a_x = (v_x_2 - v_x_1) / (t_2 - t_1);
+    double a_y = (v_y_2 - v_y_1) / (t_2 - t_1);
+
+    double x_i = (1/2 * a_x * pow(t_i-t_2, 2)) + (v_x_2 * (t_i-t_2)) + p_2.x;
+    double y_i = (1/2 * a_y * pow(t_i-t_2, 2)) + (v_y_2 * (t_i-t_2)) + p_2.y;
+
+    PF->x = x_i;
+    PF->y = y_i;
+
+
+    p_0 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i+3))), p_1 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i+2))), p_2 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i+1)));
+    t_0 = tsequence_inst_n(trajectory, i+3)->t, t_1 = tsequence_inst_n(trajectory, i+2)->t, t_2 = tsequence_inst_n(trajectory, i+1)->t;
+    v_x_1 = (p_1.x - p_0.x) / abs(t_1 - t_0), v_x_2 = (p_2.x - p_1.x) / abs(t_2 - t_1);
+    v_y_1 = (p_1.y - p_0.y) / abs(t_1 - t_0), v_y_2 = (p_2.y - p_1.y) / abs(t_2 - t_1);
+    a_x = (v_x_2 - v_x_1) / abs(t_2 - t_1);
+    a_y = (v_y_2 - v_y_1) / abs(t_2 - t_1);
+
+    x_i = (1/2 * a_x * pow(abs(t_i-t_2), 2)) + (v_x_2 * abs(t_i-t_2)) + p_2.x;
+    y_i = (1/2 * a_y * pow(abs(t_i-t_2), 2)) + (v_y_2 * abs(t_i-t_2)) + p_2.y;
+
+    PB->x = x_i;
+    PB->y = y_i;
+}
+
+/**
+ * Generate the error signal.
+ * @param trajectory The trajectory
+ * @param windows_length THe length of the window
+ * @param kernel The kernel
+ * @return The error signal
+ */
+double *
+generate_error_signal(const TSequence *trajectory, int windows_length, char kernel) {
+    int n = trajectory->count;
+    double *errorSignal = palloc(sizeof(double) * n);
+    assert(errorSignal);
+
+    int mid = windows_length/2;
+    for (int i = 0; i < mid; i++) {errorSignal[i] = 0.0;}
+
+    for (int i = mid; i < n-mid; i++) {
+        POINT2D PF, PB, PC;
+
+        switch (kernel) {
+            case 'K': assert(mid >= 3); kinematic_interpolation(trajectory, i, &PF, &PB); break;
+            case 'L':
+            default: linear_regression_interpolation(trajectory, i, mid, &PF, &PB); break;
+        }
+
+        PC = midpoint(PF, PB);
+
+        double error = haversine_distance(PC, datum_point2d(tinstant_value(tsequence_inst_n(trajectory,i))));
+
+        errorSignal[i] = error;
+    }
+
+    for (int i = 0; i < mid; i++) {errorSignal[n-i-1] = 0.0;}
+
+    return errorSignal;
+}
+
+/**
+ * Structure which contains the indices of the points at which the trajectory should be segmented.
+ */
+struct Segmentation {
+      unsigned int *indices; // Array of indices
+      unsigned int length;   // Length of the array
+  };
+
+/**
+ * Compute the segmentation with the error signal and the threshold.
+ * @param segmentation The segmentation
+ * @param error_signal The error signal
+ * @param threshold The threshold
+ * @param n The length of the trajectory
+ */
+void
+segment_with_sws(struct Segmentation *segmentation, double *error_signal, double threshold, unsigned int n) {
+    segmentation->indices = palloc(sizeof(unsigned int)*n);
+    assert(segmentation->indices);
+    segmentation->length = 0;
+
+    for (unsigned int i = 1; i < n; i++) {
+        if (error_signal[i] > threshold) {
+            segmentation->indices[segmentation->length] = i;
+            segmentation->length++;
+        }
+    }
+    segmentation->indices[segmentation->length] = n-1;
+    segmentation->length++;
+}
+
+/**
+ * Generate the array of sub-trajectories from the computed segmentation.
+ * @param trajectory The trajectory
+ * @param segmentation The segmentation
+ * @return An array of sub-trajectories
+ */
+ArrayType *
+generate_sub_trajectories(const TSequence *trajectory, struct Segmentation *segmentation) {
+    unsigned start = 0;
+    unsigned end = 0;
+
+    Temporal **sub_trajectories = palloc(sizeof(Temporal*) * segmentation->length);
+    assert(sub_trajectories);
+
+    for (unsigned int i = 0; i < segmentation->length; i++) {
+        end = segmentation->indices[i];
+
+        TInstant **instants = palloc(sizeof(TInstant*) * (end-start+1));
+        assert(instants);
+
+        for (unsigned int j = 0; j < (end-start+1); j++) {
+            instants[j] = (TInstant*) tsequence_inst_n(trajectory, start + j);
+        }
+        sub_trajectories[i] = (Temporal *) tsequence_make((const TInstant **) instants, end-start+1,
+                                                          trajectory->period.lower_inc, trajectory->period.upper_inc, true, NORMALIZE);
+        pfree(instants);
+
+        start = end;
+    }
+
+    ArrayType *result = temporalarr_to_array((const Temporal**)sub_trajectories, segmentation->length);
+    pfree(sub_trajectories);
+    return result;
+}
+
+/**
+ * Execute the Sliding Window Segmentation algorithm with a threshold.
+ * @param temp The trajectory
+ * @param threshold The threshold
+ * @param windows_length The length of the window
+ * @param kernel The kernel
+ * @return An array of sub-trajectories
+ */
+ArrayType *
+temporal_segmentation_sws_threshold(const Temporal *temp, double threshold, unsigned int windows_length, char kernel) {
+    const TSequence *trajectory = (TSequence *) temp;
+
+    unsigned int length = trajectory->count;
+
+    if (length < windows_length) {
+        return temporalarr_to_array(&temp, 1);
+    }
+
+    double *error_signal = generate_error_signal(trajectory, windows_length, kernel);
+
+    struct Segmentation segmentation;
+    segment_with_sws(&segmentation, error_signal, threshold, length);
+
+    ArrayType *result = generate_sub_trajectories(trajectory, &segmentation);
+
+    pfree(error_signal);
+    pfree(segmentation.indices);
+
+    return result;
+}
+
+/**/
+
+/* RED BLACK TREE*/
+// Implementation of red black trees taken from:
+// https://github.com/prasanthmadhavan/Red-Black-Tree
+
+  enum rbtree_node_color { RED, BLACK };
+
+  typedef struct rbtree_node_t {
+      void* key;
+      struct rbtree_node_t* left;
+      struct rbtree_node_t* right;
+      struct rbtree_node_t* parent;
+      enum rbtree_node_color color;
+  } *rbtree_node;
+
+  typedef struct rbtree_t {
+      rbtree_node root;
+  } *rbtree;
+
+  typedef int (*compare_func)(void* left, void* right);
+
+  rbtree rbtree_create();
+  void* rbtree_lookup(rbtree t, void* key, compare_func compare);
+  void rbtree_insert(rbtree t, void* key, compare_func compare);
+  void rbtree_delete(rbtree t, void* key, compare_func compare);
+  typedef rbtree_node node;
+  typedef enum rbtree_node_color color;
+
+
+  static node grandparent(node n);
+  static node sibling(node n);
+  static node uncle(node n);
+  static color node_color(node n);
+
+  static node new_node(void* key, color node_color, node left, node right);
+  static node lookup_node(rbtree t, void* key, compare_func compare);
+  static void rotate_left(rbtree t, node n);
+  static void rotate_right(rbtree t, node n);
+
+  static void replace_node(rbtree t, node oldn, node newn);
+  static void insert_case1(rbtree t, node n);
+  static void insert_case2(rbtree t, node n);
+  static void insert_case3(rbtree t, node n);
+  static void insert_case4(rbtree t, node n);
+  static void insert_case5(rbtree t, node n);
+  static node maximum_node(node root);
+  static void delete_case1(rbtree t, node n);
+  static void delete_case2(rbtree t, node n);
+  static void delete_case3(rbtree t, node n);
+  static void delete_case4(rbtree t, node n);
+  static void delete_case5(rbtree t, node n);
+  static void delete_case6(rbtree t, node n);
+
+
+  node grandparent(node n) {
+      assert (n != NULL);
+      assert (n->parent != NULL);
+      assert (n->parent->parent != NULL);
+      return n->parent->parent;
+  }
+
+  node sibling(node n) {
+      assert (n != NULL);
+      assert (n->parent != NULL);
+      if (n == n->parent->left)
+          return n->parent->right;
+      else
+          return n->parent->left;
+  }
+
+  node uncle(node n) {
+      assert (n != NULL);
+      assert (n->parent != NULL);
+      assert (n->parent->parent != NULL);
+      return sibling(n->parent);
+  }
+
+  color node_color(node n) {
+      return n == NULL ? BLACK : n->color;
+  }
+
+
+  rbtree rbtree_create() {
+      rbtree t = palloc(sizeof(struct rbtree_t));
+      t->root = NULL;
+      return t;
+  }
+
+  node new_node(void* key , color node_color, node left, node right) {
+      node result = palloc(sizeof(struct rbtree_node_t));
+      assert(result);
+      result->key = key;
+      result->color = node_color;
+      result->left = left;
+      result->right = right;
+      if (left  != NULL)  left->parent = result;
+      if (right != NULL) right->parent = result;
+      result->parent = NULL;
+      return result;
+  }
+
+  node lookup_node(rbtree t, void* key, compare_func compare) {
+      node n = t->root;
+      while (n != NULL) {
+          int comp_result = compare(key, n->key);
+          if (comp_result == 0) {
+              return n;
+          } else if (comp_result < 0) {
+              n = n->left;
+          } else {
+              assert(comp_result > 0);
+              n = n->right;
+          }
+      }
+      return n;
+  }
+
+  void* rbtree_lookup(rbtree t, void* key, compare_func compare) {
+      node n = lookup_node(t, key, compare);
+      return n == NULL ? NULL : n->key;
+  }
+
+  void rotate_left(rbtree t, node n) {
+      node r = n->right;
+      replace_node(t, n, r);
+      n->right = r->left;
+      if (r->left != NULL) {
+          r->left->parent = n;
+      }
+      r->left = n;
+      n->parent = r;
+  }
+
+  void rotate_right(rbtree t, node n) {
+      node L = n->left;
+      replace_node(t, n, L);
+      n->left = L->right;
+      if (L->right != NULL) {
+          L->right->parent = n;
+      }
+      L->right = n;
+      n->parent = L;
+  }
+
+  void replace_node(rbtree t, node oldn, node newn) {
+      if (oldn->parent == NULL) {
+          t->root = newn;
+      } else {
+          if (oldn == oldn->parent->left)
+              oldn->parent->left = newn;
+          else
+              oldn->parent->right = newn;
+      }
+      if (newn != NULL) {
+          newn->parent = oldn->parent;
+      }
+  }
+
+  void rbtree_insert(rbtree t, void* key, compare_func compare) {
+      node inserted_node = new_node(key, RED, NULL, NULL);
+      if (t->root == NULL) {
+          t->root = inserted_node;
+      } else {
+          node n = t->root;
+          while (1) {
+              int comp_result = compare(key, n->key);
+              if (comp_result <= 0) {
+                  if (n->left == NULL) {
+                      n->left = inserted_node;
+                      break;
+                  } else {
+                      n = n->left;
+                  }
+              } else {
+                  assert (comp_result > 0);
+                  if (n->right == NULL) {
+                      n->right = inserted_node;
+                      break;
+                  } else {
+                      n = n->right;
+                  }
+              }
+          }
+          inserted_node->parent = n;
+      }
+      insert_case1(t, inserted_node);
+  }
+
+  void insert_case1(rbtree t, node n) {
+      if (n->parent == NULL)
+          n->color = BLACK;
+      else
+          insert_case2(t, n);
+  }
+
+  void insert_case2(rbtree t, node n) {
+      if (node_color(n->parent) == BLACK)
+          return;
+      else
+          insert_case3(t, n);
+  }
+
+  void insert_case3(rbtree t, node n) {
+      if (node_color(uncle(n)) == RED) {
+          n->parent->color = BLACK;
+          uncle(n)->color = BLACK;
+          grandparent(n)->color = RED;
+          insert_case1(t, grandparent(n));
+      } else {
+          insert_case4(t, n);
+      }
+  }
+
+  void insert_case4(rbtree t, node n) {
+      if (n == n->parent->right && n->parent == grandparent(n)->left) {
+          rotate_left(t, n->parent);
+          n = n->left;
+      } else if (n == n->parent->left && n->parent == grandparent(n)->right) {
+          rotate_right(t, n->parent);
+          n = n->right;
+      }
+      insert_case5(t, n);
+  }
+
+  void insert_case5(rbtree t, node n) {
+      n->parent->color = BLACK;
+      grandparent(n)->color = RED;
+      if (n == n->parent->left && n->parent == grandparent(n)->left) {
+          rotate_right(t, grandparent(n));
+      } else {
+          assert (n == n->parent->right && n->parent == grandparent(n)->right);
+          rotate_left(t, grandparent(n));
+      }
+  }
+
+  void rbtree_delete(rbtree t, void* key, compare_func compare) {
+      node child;
+      node n = lookup_node(t, key, compare);
+      if (n == NULL) return;
+      if (n->left != NULL && n->right != NULL) {
+          node pred = maximum_node(n->left);
+          n->key   = pred->key;
+          n = pred;
+      }
+
+      child = n->right == NULL ? n->left  : n->right;
+      if (node_color(n) == BLACK) {
+          n->color = node_color(child);
+          delete_case1(t, n);
+      }
+      replace_node(t, n, child);
+      if (n->parent == NULL && child != NULL)
+          child->color = BLACK;
+      pfree(n);
+
+  }
+
+  static node maximum_node(node n) {
+      assert (n != NULL);
+      while (n->right != NULL) {
+          n = n->right;
+      }
+      return n;
+  }
+
+  void delete_case1(rbtree t, node n) {
+      if (n->parent == NULL)
+          return;
+      else
+          delete_case2(t, n);
+  }
+
+  void delete_case2(rbtree t, node n) {
+      if (node_color(sibling(n)) == RED) {
+          n->parent->color = RED;
+          sibling(n)->color = BLACK;
+          if (n == n->parent->left)
+              rotate_left(t, n->parent);
+          else
+              rotate_right(t, n->parent);
+      }
+      delete_case3(t, n);
+  }
+
+  void delete_case3(rbtree t, node n) {
+      if (node_color(n->parent) == BLACK &&
+          node_color(sibling(n)) == BLACK &&
+          node_color(sibling(n)->left) == BLACK &&
+          node_color(sibling(n)->right) == BLACK)
+      {
+          sibling(n)->color = RED;
+          delete_case1(t, n->parent);
+      }
+      else
+          delete_case4(t, n);
+  }
+
+  void delete_case4(rbtree t, node n) {
+      if (node_color(n->parent) == RED &&
+          node_color(sibling(n)) == BLACK &&
+          node_color(sibling(n)->left) == BLACK &&
+          node_color(sibling(n)->right) == BLACK)
+      {
+          sibling(n)->color = RED;
+          n->parent->color = BLACK;
+      }
+      else
+          delete_case5(t, n);
+  }
+
+  void delete_case5(rbtree t, node n) {
+      if (n == n->parent->left &&
+          node_color(sibling(n)) == BLACK &&
+          node_color(sibling(n)->left) == RED &&
+          node_color(sibling(n)->right) == BLACK)
+      {
+          sibling(n)->color = RED;
+          sibling(n)->left->color = BLACK;
+          rotate_right(t, sibling(n));
+      }
+      else if (n == n->parent->right &&
+               node_color(sibling(n)) == BLACK &&
+               node_color(sibling(n)->right) == RED &&
+               node_color(sibling(n)->left) == BLACK)
+      {
+          sibling(n)->color = RED;
+          sibling(n)->right->color = BLACK;
+          rotate_left(t, sibling(n));
+      }
+      delete_case6(t, n);
+  }
+
+  void delete_case6(rbtree t, node n) {
+      sibling(n)->color = node_color(n->parent);
+      n->parent->color = BLACK;
+      if (n == n->parent->left) {
+          assert (node_color(sibling(n)->right) == RED);
+          sibling(n)->right->color = BLACK;
+          rotate_left(t, n->parent);
+      }
+      else
+      {
+          assert (node_color(sibling(n)->left) == RED);
+          sibling(n)->left->color = BLACK;
+          rotate_right(t, n->parent);
+      }
+  }
+
+/**
+ * Free the memory taken by the tree.
+ * @param n The current node
+ */
+void freeBinaryTree(node n) {
+    if (n) {
+        freeBinaryTree(n->left);
+        freeBinaryTree(n->right);
+        pfree(n);
+    }
+}
+
+/**
+ * Search the minimum double in the tree.
+ * @param tree The tree
+ * @return The minimum double
+ */
+double searchMin(rbtree tree) {
+  node current = tree->root;
+  if (!current) {return -1.0;}
+  while (current->left) {current = current->left;}
+  return *((double*) current->key);
+}
+
+/**
+ * Search the maximum double in the tree.
+ * @param tree The tree
+ * @return The maximum double
+ */
+double searchMax(rbtree tree) {
+  node current = tree->root;
+  if (!current) {return -1.0;}
+  while (current->right) {current = current->right;}
+  return *((double*) current->key);
+}
+
+/**/
+
+/**
+ * Compare two integers.
+ * @param leftp The left integer
+ * @param rightp The right integer
+ * @return 0 if = | 1 if > | -1 if <
+ */
+int compare_double(void* leftp, void* rightp) {
+  double left = *((double*)leftp);
+  double right = *((double*)rightp);
+  if (left < right)
+      return -1;
+  else if (left > right)
+      return 1;
+  else {
+      return 0;
+  }
+}
+
+/**
+ * Compute the percentile of an array of float.
+ * @param array The array
+ * @param length The length of the array
+ * @param percentile The percentile
+ * @return The computed value
+ */
+double get_percentile(const double* array, int length, double percentile) {
+  int n = length * (100 - percentile) / 100;
+  rbtree t = rbtree_create();
+
+  for (int i = 0; i < n; i++) {
+      rbtree_insert(t, (void*)(&array[i]), compare_double);
+  }
+
+  double min = searchMin(t);
+
+  for (int i = n; i < length; i++) {
+      if (array[i] > min) {
+          rbtree_delete(t,(void*)(&min), compare_double);
+          rbtree_insert(t, (void*)(&array[i]), compare_double);
+          min = searchMin(t);
+      }
+  }
+
+  double res = min;
+  freeBinaryTree(t->root);
+  pfree(t);
+  return res;
+}
+
+/**
+ * Execute the Sliding Window Segmentation algorithm with a percentile.
+ * @param temp The trajectory
+ * @param percentile The percentile
+ * @param windows_length The length of the window
+ * @param kernel The kernel
+ * @return An array of sub-trajectories
+ */
+ArrayType *
+temporal_segmentation_sws_percentile(const Temporal *temp, double percentile, unsigned int windows_length, char kernel) {
+    const TSequence *trajectory = (TSequence *) temp;
+
+    unsigned int length = trajectory->count;
+
+    if (length < windows_length) {
+        return temporalarr_to_array(&temp, 1);
+    }
+
+    double *error_signal = generate_error_signal(trajectory, windows_length, kernel);
+
+    double threshold = get_percentile(error_signal, length, percentile);
+
+    struct Segmentation segmentation;
+    segment_with_sws(&segmentation, error_signal, threshold, length);
+
+    ArrayType *result = generate_sub_trajectories(trajectory, &segmentation);
+
+    pfree(error_signal);
+    pfree(segmentation.indices);
+
+    return result;
+}
+
+/**
+ * Block of the run length encoding of a compressed matrix.
+ */
+struct Block {
+    unsigned int start; // The start of the block
+    unsigned int end;   // The end of the block
+    struct Block *next; // The next block
+};
+
+
+/**
+ * Compressed Start-Stop Matrix.
+ */
+struct CSSM {
+      struct Block** blocks; // The list of blocks
+      unsigned int n;        // The length of the start-stop matrix
+};
+
+/**
+ * Compute the negation of a compressed start-stop matrix.
+ * @param cssm The compressed start-stop matrix
+ */
+void negateCSSM(struct CSSM* cssm) {
+    struct Block **blocks = palloc(sizeof(struct Block*)*cssm->n);
+    for (unsigned int i = 0; i < cssm->n; i++) {
+        struct Block *current_block = cssm->blocks[i];
+        struct Block *last_block = NULL;
+        unsigned int start = 0;
+        unsigned int end = -1;
+        blocks[i] = NULL;
+
+        while (current_block!=NULL) {
+            end = current_block->start;
+
+            if (start != end) {
+                struct Block *new_block = palloc(sizeof(struct Block));
+                new_block->start = start;
+                new_block->end = end;
+                new_block->next = NULL;
+                start = current_block->end;
+
+                if (last_block == NULL) {
+                    blocks[i] = new_block;
+                }
+                else {
+                    last_block->next = new_block;
+                }
+                last_block = new_block;
+            }
+            current_block = current_block->next;
+        }
+        if (start < i) {
+            struct Block *new_block = palloc(sizeof(struct Block));
+            new_block->start = start;
+            new_block->end = i;
+            new_block->next = NULL;
+            if (last_block == NULL) {
+                blocks[i] = new_block;
+            }
+            else {
+                last_block->next = new_block;
+            }
+        }
+    }
+    cssm->blocks = blocks;
+}
+
+/**
+ * Compute the compressed start-stop matrix for the time criterion.
+ * @param trajectory The trajectory
+ * @param time The time threshold
+ * @return The compressed start-stop matrix
+ */
+struct CSSM generate_CSSM_time(const TSequence *trajectory, double time) {
+  struct CSSM cssm = {.n = trajectory->count, .blocks = palloc(sizeof(struct Block *)*trajectory->count)};
+  assert(cssm.blocks);
+
+  int i = trajectory->count-1;
+
+  for (int j = trajectory->count-1; j >= 0; j--) {
+      while (i >= 0 && ((double)(tsequence_inst_n(trajectory, j)->t - tsequence_inst_n(trajectory, i)->t))/1000000.0/60.0 < time) { // Minutes
+          i--;
+      }
+      struct Block *block = palloc(sizeof(struct Block));
+      assert(block);
+      block->start = i;
+      block->end = j;
+      block->next = NULL;
+      cssm.blocks[j] = block;
+  }
+  negateCSSM(&cssm);
+
+  return cssm;
+}
+
+double searchMin(rbtree tree);
+double searchMax(rbtree tree);
+
+/**
+ * Compute the compressed start-stop matrix for the speed range criterion.
+ * @param trajectory The trajectory
+ * @param threshold The speed threshold
+ * @return The compressed start-stop matrix
+ */
+struct CSSM generate_CSSM_speed(const TSequence *trajectory, double threshold) {
+  struct CSSM cssm = {.n = trajectory->count, .blocks = palloc(sizeof(struct Block *)*trajectory->count)};
+  assert(cssm.blocks);
+
+  double *speed = palloc(sizeof(double)*trajectory->count);
+  for (int i = 0; i < trajectory->count-1; i++) {
+      int t_0 = tsequence_inst_n(trajectory, i)->t, t_1 = tsequence_inst_n(trajectory, i+1)->t;
+      POINT2D p_0 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i))), p_1 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i+1)));
+      speed[i] = (haversine_distance(p_0, p_1)/1000) / (((double)(t_1 - t_0))/1000000/3600);
+  }
+  speed[trajectory->count-1] = speed[trajectory->count-2];
+
+  int i = trajectory->count-1;
+
+  rbtree t = rbtree_create();
+  rbtree_insert(t, (void*)(&speed[i]), compare_double);
+  for (int j = trajectory->count-1; j >= 0; j--) {
+      while (i >= 0 && (searchMax(t) - searchMin(t) <= threshold)) {
+          i--;
+          rbtree_insert(t, (void*)(&speed[i]), compare_double);
+      }
+      struct Block *block = palloc(sizeof(struct Block));
+
+      block->start = ((i>=0) ? (i):(0));
+      block->end = j;
+      block->next = NULL;
+      cssm.blocks[j] = block;
+      rbtree_delete(t, (void*)(&speed[j]), compare_double);
+  }
+
+  return cssm;
+}
+/**
+ * Return the absolute difference between two angles (in degrees).
+ * @param angle_a The first angle
+ * @param angle_b The second angle
+ * @return The difference
+ */
+double
+get_angle_diff(double angle_a, double angle_b) {
+    double x = 360 - fabs(angle_a - angle_b);
+    double y = fabs(angle_a - angle_b);
+
+    if (x < y) {
+        return x;
+    }
+    else {
+        return y;
+    }
+}
+
+/**
+ * Compute the compressed start-stop matrix for the angular criterion.
+ * @param trajectory The trajectory
+ * @param threshold The angle threshold
+ * @return The compressed start-stop matrix
+ */
+struct CSSM generate_CSSM_angular(const TSequence *trajectory, double threshold) {
+  struct CSSM cssm = {.n = trajectory->count, .blocks = palloc(sizeof(struct Block *)*trajectory->count)};
+  assert(cssm.blocks);
+
+  double *angle = palloc(sizeof(double)*trajectory->count);
+  for (int i = 0; i < trajectory->count-1; i++) {
+      POINT2D p_0 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i))), p_1 = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, i+1)));
+      angle[i] = bearing(p_0, p_1);
+  }
+  angle[trajectory->count-1] = angle[trajectory->count-2];
+
+  int i = trajectory->count-1;
+
+  for (int j = trajectory->count-1; j >= 0; j--) {
+      while (i >= 0 && ((i == j) || (get_angle_diff(angle[i], angle[i-1]) <= threshold))) {
+          i--;
+      }
+      struct Block *block = palloc(sizeof(struct Block));
+
+      block->start = ((i>=0) ? (i):(0));
+      block->end = j;
+      block->next = NULL;
+      cssm.blocks[j] = block;
+  }
+
+  return cssm;
+}
+
+/**
+ * Compare the latitude of two points.
+ * @param leftp The left point
+ * @param rightp The right point
+ * @return 0 if = | 1 if > | -1 if <
+ */
+int compare_lat(void* leftp, void* rightp) {
+  POINT2D left = *((POINT2D*)leftp);
+  POINT2D right = *((POINT2D*)rightp);
+  if (left.y < right.y)
+      return -1;
+  else if (left.y > right.y)
+      return 1;
+  else {
+      return 0;
+  }
+}
+
+/**
+ * Compare the longitude of two points.
+ * @param leftp The left point
+ * @param rightp The right point
+ * @return 0 if = | 1 if > | -1 if <
+ */
+int compare_lon(void* leftp, void* rightp) {
+  POINT2D left = *((POINT2D*)leftp);
+  POINT2D right = *((POINT2D*)rightp);
+  if (left.x < right.x)
+      return -1;
+  else if (left.x > right.x)
+      return 1;
+  else {
+      return 0;
+  }
+}
+
+/**
+ * Search left most point.
+ * @param tree The tree
+ * @return The left most point
+ */
+POINT2D*
+search_min_point(rbtree tree) {
+  node current = tree->root;
+  if (!current) {return NULL;}
+  while (current->left) {current = current->left;}
+  return (POINT2D*) current->key;
+}
+
+/**
+ * Search right most point.
+ * @param tree The tree
+ * @return The right most point
+ */
+POINT2D*
+search_max_point(rbtree tree) {
+  node current = tree->root;
+  if (!current) {return NULL;}
+  while (current->right) {current = current->right;}
+  return (POINT2D*) current->key;
+}
+
+/**
+ * A circle
+ */
+struct Circle_c {
+  POINT2D center; // The center of the circle
+  double radius;  // the radius of the circle
+};
+
+/**
+ * Compute the circle given the fact that the points are located on its edge.
+ * @param R The points
+ * @param n The number of points
+ * @return The circle
+ */
+struct Circle_c
+get_trivial_circle(POINT2D **R, unsigned int n) {
+    POINT2D p = {.x=0, .y=0};
+    struct Circle_c circle = {.center=p, .radius=0.0};
+    if (n == 0) {
+        return circle;
+    }
+    else if (n == 1) {
+        circle.center.x = R[0]->x;
+        circle.center.y = R[0]->y;
+        return circle;
+    }
+    else if (n == 2) {
+        POINT2D temp = midpoint(*R[0], *R[1]);
+        circle.center.x = temp.x;
+        circle.center.y = temp.y;
+        circle.radius = haversine_distance(circle.center, *R[1]);
+        return circle;
+    }
+    else {
+        double bx = R[1]->x - R[0]->x, by = R[1]->y - R[0]->y, cx = R[2]->x - R[0]->x, cy = R[2]->y - R[0]->y;
+
+        double B = pow(bx, 2) + pow(by, 2), C = pow(cx, 2) + pow(cy, 2), D = bx * cy - by * cx;
+
+        circle.center.x = R[0]->x + ((cy * B - by * C) / (2 * D));
+        circle.center.y = R[0]->y + ((bx * C - cx * B) / (2 * D));
+
+        double max = -1;
+        for (int i = 0; i < 3; i++) {
+            double temp = haversine_distance(*R[i], circle.center);
+            if (temp > max) {
+                max = temp;
+            }
+        }
+        circle.radius = max;
+        return circle;
+    }
+}
+
+/**
+ * Execute the welzl algorithm
+ * @param P The points
+ * @param R The points to form a circle
+ * @param n_p The number of points in P
+ * @param n_r The number of points in R
+ * @return The circle
+ */
+struct Circle_c
+welzl(POINT2D** P, POINT2D** R, unsigned int n_p, unsigned int n_r) { // Based on https://www.geeksforgeeks.org/minimum-enclosing-circle-set-2-welzls-algorithm/
+  if (n_p == 0 || n_r == 3) {
+      return get_trivial_circle(R, n_r);
+  }
+
+  int i = rand() % n_p;
+
+  POINT2D *temp = P[i];
+  P[i] = P[n_p-1];
+  P[n_p-1] = temp;
+
+  struct Circle_c circle = welzl(P, R, n_p-1, n_r);
+
+  if (haversine_distance(circle.center, *P[n_p-1]) <= circle.radius) {
+      return circle;
+  }
+
+  R[n_r] = P[n_p-1];
+  n_r++;
+
+  return welzl(P, R, n_p-1, n_r);
+}
+
+/**
+ * Get the diameter of the minimum enclosing circle of four points.
+ * @param points The four points
+ * @return
+ */
+double
+get_mec_diameter(POINT2D** points) {
+  unsigned int nb = 4;
+  POINT2D* R[nb];
+
+  struct Circle_c circle = welzl(points, R, nb, 0);
+
+  return circle.radius * 2;
+}
+
+/**
+ * Compute the compressed start-stop matrix for the disk criterion.
+ * @param trajectory The trajectory
+ * @param distance The maximum length of the disk
+ * @return The compressed start-stop matrix
+ */
+struct CSSM generate_CSSM_disk(const TSequence *trajectory, double distance) {
+  struct CSSM cssm = {.n = trajectory->count, .blocks = palloc(sizeof(struct Block *)*trajectory->count)};
+  assert(cssm.blocks);
+
+  int i = trajectory->count-1;
+
+  rbtree t_lat = rbtree_create();
+  rbtree t_lon = rbtree_create();
+
+  POINT2D *points_array = palloc(sizeof(POINT2D)*trajectory->count);
+
+  for (int x = 0; x < trajectory->count; x++) {
+      points_array[x] = datum_point2d(tinstant_value(tsequence_inst_n(trajectory, x)));
+  }
+
+  POINT2D *p = &points_array[i];
+  rbtree_insert(t_lat, (void*)(p), compare_lat);
+  rbtree_insert(t_lon, (void*)(p), compare_lon);
+  POINT2D *points[4] = {p, p, p, p};
+
+  for (int j = trajectory->count-1; j >= 0; j--) {
+      while (i >= 0 && ( i == j || get_mec_diameter(points) <= distance)) {
+          i--;
+          p = &points_array[i];
+          rbtree_insert(t_lat, (void*)(p), compare_lat);
+          rbtree_insert(t_lon, (void*)(p), compare_lon);
+          points[0] = search_min_point(t_lat); points[1] = search_min_point(t_lon);
+          points[2] = search_max_point(t_lat); points[3] = search_max_point(t_lon);
+      }
+      struct Block *block = palloc(sizeof(struct Block));
+
+      block->start = ((i>=0) ? (i):(0));
+      block->end = j;
+      block->next = NULL;
+      cssm.blocks[j] = block;
+
+      p = &points_array[j];
+      rbtree_delete(t_lat, (void*)(p), compare_lat);
+      rbtree_delete(t_lon, (void*)(p), compare_lon);
+      points[0] = search_min_point(t_lat); points[1] = search_min_point(t_lon);
+      points[2] = search_max_point(t_lat); points[3] = search_max_point(t_lon);
+  }
+  pfree(points_array);
+  return cssm;
+
+}
+
+/**
+ * Verify if the ranges of the first and second block intersect.
+ * @param a The first block
+ * @param b The second block
+ * @return True if they intersect else False
+ */
+bool
+block_intersect(struct Block *a, struct Block *b) {
+  return (a->end >= b->start) && (b->end >= a->start);
+}
+
+/**
+ * Compute the conjunction of two compressed start-stop matrices.
+ * @param a The first compressed start-stop matrix
+ * @param b The second compressed start-stop matrix
+ */
+void
+conjunction_cssm(struct CSSM *a, struct CSSM *b) {
+    struct Block **blocks = palloc(sizeof(struct Block*)*a->n);
+
+    for (unsigned int i = 0; i < a->n; i++) {
+        struct Block *block_a = a->blocks[i];
+        struct Block *block_b = b->blocks[i];
+
+        struct Block *last_block = NULL;
+        blocks[i] = NULL;
+
+        while (block_a != NULL && block_b != NULL) {
+            if (block_intersect(block_a, block_b)) {
+                struct Block *new_block = palloc(sizeof(struct Block));
+                new_block->next=NULL;
+                new_block->start = (block_a->start > block_b->start) ? block_a->start : block_b->start;
+                new_block->end = (block_a->end > block_b->end) ? block_b->end : block_a->end;
+                if (last_block == NULL) {
+                    blocks[i] = new_block;
+                }
+                else {
+                    last_block->next = new_block;
+                }
+                last_block = new_block;
+            }
+
+            if (block_a->end < block_b->end) {
+                block_a = block_a->next;
+            }
+            else {
+                block_a = block_b->next;
+            }
+        }
+    }
+    a->blocks = blocks;
+
+}
+
+/**
+ * Compute the disjunction of two compressed start-stop matrices.
+ * @param a The first compressed start-stop matrix
+ * @param b The second compressed start-stop matrix
+ */
+void
+disjunction_cssm(struct CSSM *a, struct CSSM *b) {
+    struct Block **blocks = palloc(sizeof(struct Block*)*a->n);
+
+    for (unsigned int i = 0; i < a->n; i++) {
+        struct Block *block_a = a->blocks[0];
+        struct Block *block_b = b->blocks[0];
+        struct Block *last_block = NULL;
+
+        blocks[i] = NULL;
+
+        while (block_a != NULL || block_b != NULL) {
+            struct Block *new_block = palloc(sizeof(struct Block));
+            new_block->next = NULL;
+            bool still_intersect = true;
+
+            if (block_a != NULL && block_b != NULL) {
+                if (block_a->start <= block_b->start) {
+                    new_block->start = block_a->start;
+                    new_block->end = block_a->end;
+                    block_a = block_a->next;
+                }
+                else {
+                    new_block->start = block_b->start;
+                    new_block->end = block_b->end;
+                    block_b = block_b->next;
+                }
+            }
+
+            else if (block_a != NULL) {
+                new_block->start = block_a->start;
+                new_block->end = block_a->end;
+                block_a = block_a->next;
+            }
+            else {
+                new_block->start = block_b->start;
+                new_block->end = block_b->end;
+                block_b = block_b->next;
+            }
+            while (still_intersect) {
+                still_intersect = false;
+                if (block_a != NULL && block_intersect(block_a, new_block)) {
+                    still_intersect = true;
+                    new_block->start = (new_block->start > block_a->start) ? block_a->start:new_block->start;
+                    new_block->end = (new_block->end < block_a->end) ? block_a->end : new_block->end;
+                    block_a = block_a->next;
+                }
+                else if (block_b != NULL && block_intersect(block_b, new_block)) {
+                    still_intersect = true;
+                    new_block->start = (new_block->start > block_b->start) ? block_b->start:new_block->start;
+                    new_block->end = (new_block->end < block_b->end) ? block_b->end : new_block->end;
+                    block_b = block_b->next;
+                }
+
+            }
+
+            if (last_block != NULL) {
+                last_block->next = new_block;
+            }
+            else {
+                blocks[i] = new_block;
+            }
+
+            last_block = new_block;
+        }
+    }
+    a->blocks = blocks;
+}
+
+/**
+ * Node of a segmentation tree.
+ */
+ struct CNode {
+     unsigned int count, index;
+     struct CNode *last, *argmin;
+
+     enum rbtree_node_color color;
+     struct CNode *parent, *left, *right;
+ };
+
+/**
+ * Compare two nodes of a segmentation tree.
+ * @param leftp The left node
+ * @param rightp The right node
+ * @return 0 if = | 1 if > | -1 if <
+ */
+int compare_cnode(void* leftp, void* rightp) {
+  struct CNode* left = (struct CNode*)leftp;
+  struct CNode* right = (struct CNode*)rightp;
+  if (left->index < right->index)
+      return -1;
+  else if (left->index > right->index)
+      return 1;
+  else {
+      return 0;
+  }
+}
+
+/**
+ * Search the previous node of a node.
+ * @param n The node
+ * @return The previous node
+ */
+node
+rbtree_get_previous(node n) {
+    if (n->left != NULL) {
+        n = n->left;
+        while (n->right != NULL) {
+            n = n->right;
+        }
+        return n;
+    }
+    else if (n->parent!=NULL) {
+        if (n->parent->right == n) {
+            return n->parent;
+        }
+        else {
+            while (n->parent->right != n) {
+                if (n->parent->parent == NULL) {
+                    return NULL;
+                }
+                n = n->parent;
+            }
+            return n->parent;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * Search the next node of a node.
+ * @param n The node
+ * @return The next node
+ */
+node
+rbtree_get_next(node n) {
+  if (n->right != NULL) {
+      n = n->right;
+      while (n->left != NULL) {
+          n = n->left;
+      }
+      return n;
+  }
+  else if (n->parent!=NULL) {
+      if (n->parent->left == n) {
+          return n->parent;
+      }
+      else {
+          while (n->parent->left != n) {
+              if (n->parent->parent == NULL) {
+                  return NULL;
+              }
+              n = n->parent;
+          }
+          return n->parent;
+      }
+  }
+  return NULL;
+}
+
+/*Segmentation tree*/
+struct segmentation_tree {
+  struct CNode *root;
+};
+
+    void insert_case1_segmentation(struct segmentation_tree *t, struct CNode *n);
+    void insert_case2_segmentation(struct segmentation_tree *t, struct CNode *n);
+    void insert_case3_segmentation(struct segmentation_tree *t, struct CNode *n);
+    void insert_case4_segmentation(struct segmentation_tree *t, struct CNode *n);
+    void insert_case5_segmentation(struct segmentation_tree *t, struct CNode *n);
+
+
+      void rbtree_insert_segmentation(struct segmentation_tree *t, struct CNode *inserted_node) {
+      inserted_node->left = NULL;
+      inserted_node->right = NULL;
+      inserted_node->parent = NULL;
+      inserted_node->color = RED;
+      inserted_node->argmin = inserted_node;
+
+      if (t->root == NULL) {
+          t->root = inserted_node;
+      } else {
+          struct CNode *n = t->root;
+          while (1) {
+              if (n->argmin->count > inserted_node->count) {
+                  n->argmin = inserted_node;
+              }
+              if (inserted_node->index <= n->index) {
+                  if (n->left == NULL) {
+                      n->left = inserted_node;
+                      break;
+                  } else {
+                      n = n->left;
+                  }
+              } else {
+                  if (n->right == NULL) {
+                      n->right = inserted_node;
+                      break;
+                  } else {
+                      n = n->right;
+                  }
+              }
+          }
+          inserted_node->parent = n;
+      }
+      insert_case1_segmentation(t, inserted_node);
+  }
+
+  color node_color_segmentation(struct CNode *n) {
+      return n == NULL ? BLACK : n->color;
+  }
+  struct CNode *grandparent_segmentation(struct CNode *n) {
+      return n->parent->parent;
+  }
+
+  struct CNode *sibling_segmentation(struct CNode *n) {
+      if (n == n->parent->left)
+          return n->parent->right;
+      else
+          return n->parent->left;
+  }
+
+  struct CNode *uncle_segmentation(struct CNode *n) {
+      return sibling_segmentation(n->parent);
+  }
+
+  void replace_node_segmentation(struct segmentation_tree *t, struct CNode *oldn, struct CNode *newn) {
+      if (oldn->parent == NULL) {
+          t->root = newn;
+      } else {
+          if (oldn == oldn->parent->left)
+              oldn->parent->left = newn;
+          else
+              oldn->parent->right = newn;
+      }
+      if (newn != NULL) {
+          newn->parent = oldn->parent;
+      }
+  }
+
+
+  void rotate_left_segmentation(struct segmentation_tree *t, struct CNode *n) {
+      struct CNode *r = n->right;
+      replace_node_segmentation(t, n, r);
+      n->right = r->left;
+      if (r->left != NULL) {
+          r->left->parent = n;
+      }
+      r->left = n;
+      n->parent = r;
+
+      r->argmin = n->argmin;
+      n->argmin = n;
+      if (n->left != NULL && n->argmin->count > n->left->argmin->count) {n->argmin = n->left->argmin;}
+      if (n->right != NULL && n->argmin->count > n->right->argmin->count) {n->argmin = n->right->argmin;}
+  }
+
+  void rotate_right_segmentation(struct segmentation_tree *t, struct CNode *n) {
+      struct CNode *L = n->left;
+      replace_node_segmentation(t, n, L);
+      n->left = L->right;
+      if (L->right != NULL) {
+          L->right->parent = n;
+      }
+      L->right = n;
+      n->parent = L;
+
+      L->argmin = n->argmin;
+      n->argmin = n;
+      if (n->left != NULL && n->argmin->count > n->left->argmin->count) {n->argmin = n->left->argmin;}
+      if (n->right != NULL && n->argmin->count > n->right->argmin->count) {n->argmin = n->right->argmin;}
+  }
+
+
+  void insert_case1_segmentation(struct segmentation_tree *t, struct CNode *n) {
+      if (n->parent == NULL)
+          n->color = BLACK;
+      else
+          insert_case2_segmentation(t, n);
+  }
+
+
+  void insert_case2_segmentation(struct segmentation_tree *t, struct CNode *n) {
+      if (node_color_segmentation(n->parent) == BLACK)
+          return;
+      else
+          insert_case3_segmentation(t, n);
+  }
+
+  void insert_case3_segmentation(struct segmentation_tree *t, struct CNode *n) {
+      if (node_color_segmentation(uncle_segmentation(n)) == RED) {
+          n->parent->color = BLACK;
+          uncle_segmentation(n)->color = BLACK;
+          grandparent_segmentation(n)->color = RED;
+          insert_case1_segmentation(t, grandparent_segmentation(n));
+      } else {
+          insert_case4_segmentation(t, n);
+      }
+  }
+
+  void insert_case4_segmentation(struct segmentation_tree *t, struct CNode *n) {
+      if (n == n->parent->right && n->parent == grandparent_segmentation(n)->left) {
+          rotate_left_segmentation(t, n->parent);
+          n = n->left;
+      } else if (n == n->parent->left && n->parent == grandparent_segmentation(n)->right) {
+          rotate_right_segmentation(t, n->parent);
+          n = n->right;
+      }
+      insert_case5_segmentation(t, n);
+  }
+
+  void insert_case5_segmentation(struct segmentation_tree *t, struct CNode *n) {
+      n->parent->color = BLACK;
+      grandparent_segmentation(n)->color = RED;
+      if (n == n->parent->left && n->parent == grandparent_segmentation(n)->left) {
+          rotate_right_segmentation(t, grandparent_segmentation(n));
+      } else {
+          rotate_left_segmentation(t, grandparent_segmentation(n));
+      }
+  }
+
+
+/**/
+
+/**
+ * Return the last common node from the search paths to b->start and the one to b->end
+ * @param t The tree
+ * @param b The block
+ * @return The split node
+ */
+struct CNode *
+get_split_node(struct segmentation_tree *t, struct Block * b) {
+
+    if (!t->root) return NULL;
+
+    struct CNode *node_x = t->root;
+    struct CNode *node_y = t->root;
+
+    while (node_x == node_y && node_x->index != b->start && node_y->index != b->end) {
+        if (node_x->index < b->start) {
+            node_x = node_x->right;
+        }
+        else {
+            node_x = node_x->left;
+        }
+
+        if (node_y->index < b->end) {
+            node_y = node_y->right;
+        }
+        else {
+            node_y = node_y->left;
+        }
+    }
+
+    if (node_x == node_y) {
+        return node_x;
+    }
+    else {
+        return node_x->parent;
+    }
+}
+
+/**
+ * Search the node with the minimal count which is contained in the range of the block in the tree.
+ * @param t The tree
+ * @param b The block
+ * @return The minimal count node
+ */
+struct CNode *
+get_minimal_count(struct segmentation_tree *t, struct Block *b) {
+
+      struct CNode *v_split = get_split_node(t, b);
+      struct CNode *v_min = v_split;
+
+      struct CNode *v_current = v_split->left;
+
+      while (v_current && v_current->index != b->start) {
+
+          if (v_current->index >= b->start && v_min->count > v_current->count) {v_min = v_current;}
+
+          if (v_current->index > b->start) {
+              if (v_current->right && v_min->count > v_current->right->argmin->count) {v_min = v_current->right->argmin;}
+              v_current = v_current->left;
+          }
+          else {
+              v_current = v_current->right;
+          }
+      }
+
+      if (v_current && v_min->count >= v_current->count) {
+          v_min = v_current;
+      }
+
+      v_current = v_split->right;
+
+      while (v_current && v_current->index != b->end) {
+
+          if (v_current->index <= b->end && v_min->count > v_current->count) {v_min = v_current;}
+
+          if (v_current->index > b->end) {
+              v_current = v_current->left;
+          }
+          else {
+              if (v_current->left && v_min->count > v_current->left->argmin->count) {v_min = v_current->left->argmin;}
+              v_current = v_current->right;
+          }
+      }
+
+      if (v_current && v_min->count >= v_current->count) {
+          v_min = v_current;
+      }
+
+      return v_min;
+}
+
+
+/**
+ * Compute the segmentation tree from the compressed start-stop matrix.
+ * @param cssm The compressed start-stop matrix
+ * @return The segmentation tree
+ */
+struct segmentation_tree*
+  compute_segmentation_tree(struct CSSM *cssm) {
+    struct segmentation_tree *t = palloc(sizeof(struct segmentation_tree));
+    t->root = NULL;
+
+      struct CNode *v = palloc(sizeof(struct CNode));
+      v->index = 0;
+      v->count = 0;
+      rbtree_insert_segmentation(t, v);
+
+      for (unsigned int i = 1; i < cssm->n; i++) {
+          v = palloc(sizeof(struct CNode));
+          v->index = i;
+          v->count = INT_MAX;
+          v->last = NULL;
+          struct Block *b = cssm->blocks[i];
+          while (b != NULL) {
+              struct CNode *vp = get_minimal_count(t, b);
+
+              if (vp->count != INT_MAX && vp->count+1 < v->count) {
+                  v->count = vp->count+1;
+                  v->last = vp;
+              }
+              b = b->next;
+          }
+          rbtree_insert_segmentation(t, v);
+      }
+
+      return t;
+  }
+
+/**
+ * Search the node which contains the index in the tree.
+ * @param t The tree
+ * @param index The index
+ * @return The node
+ */
+struct CNode*
+rbtree_find(struct segmentation_tree *t, unsigned int index) {
+
+  struct CNode *current = t->root;
+
+  if (!current) return NULL;
+
+  while (current->index != index) {
+      if (current->index < index) {
+          current = current->right;
+      }
+      else {
+          current = current->left;
+      }
+      assert(current);
+  }
+
+  return current;
+}
+
+/**
+ * Compute the segmentation with the segmentation tree.
+ * @param segmentation The segmentation
+ * @param t The tree
+ * @param n The length of the trajectory
+ */
+void
+segment_with_stable_criteria(struct Segmentation *segmentation, struct segmentation_tree *t, unsigned int n) {
+    segmentation->indices = palloc(sizeof(unsigned int)*n);
+    assert(segmentation->indices);
+    segmentation->length = 0;
+
+    unsigned int *temp_segmentation = palloc(sizeof(unsigned int)*n);
+    unsigned int temp_number = 1;
+    temp_segmentation[0] = n-1;
+
+    struct CNode *v = rbtree_find(t, n-1);
+
+    int a = n-2;
+    while (a > 0 && v->count == INT_MAX) {
+        v = rbtree_find(t, a);
+        a--;
+    }
+
+    if (a == 0) {
+        pfree(temp_segmentation);
+        segmentation->indices[0] = n-1;
+        segmentation->length = 1;
+        return;
+    }
+
+
+    int k = v->count;
+    while (k > 1) {
+        // [v->last->index, v->index)]
+        temp_segmentation[temp_number] = v->last->index;
+        temp_number++;
+
+        v = v->last;
+        k--;
+    }
+
+    for (int i = temp_number-1; i >= 0; i--) {
+        segmentation->indices[segmentation->length] = temp_segmentation[i];
+        segmentation->length++;
+    }
+
+    pfree(temp_segmentation);
+}
+
+/**
+ * The types of token
+ */
+enum token_type {function_t, number_t, open_t, close_t, eof_t, not_t};
+
+
+/**
+ * A token
+ */
+struct c_token {
+    enum token_type type; // Type
+    char* value;          // The pointer to its value
+  };
+
+
+/**
+ * Parse the string and return the next token
+ * @param token The next token
+ * @param criteria The string
+ * @param offset The offset
+ * @return The new offset
+ */
+unsigned int
+get_next_token(struct c_token *token, char *criteria, unsigned int offset) {
+    char c = criteria[offset];
+
+    while (c == ' ') {
+        offset++;
+        c = criteria[offset];
+    }
+
+    if (isalpha(c)) {
+        token->type = function_t;
+        token->value = &criteria[offset];
+        offset += 1;
+    }
+    else if (c == '[') {
+        token->type = number_t;
+        token->value = &criteria[offset+1];
+
+        int i = 1;
+        c = criteria[offset+i];
+        while ((isdigit(c) || c == '.')) {
+            i++;
+            c = criteria[offset+i];
+        }
+        offset += i+1;
+    }
+    else if (c == '!') {
+        token->type = not_t;
+        token->value = &criteria[offset];
+        offset += 1;
+    }
+    else if (c == '(') {
+        token->type = open_t;
+        token->value = &criteria[offset];
+        offset += 1;
+    }
+
+    else if (c == ')') {
+        token->type = close_t;
+        token->value = &criteria[offset];
+        offset += 1;
+    }
+    else {
+        token->type = eof_t;
+        token->value = &criteria[offset];
+        offset += 1;
+    }
+
+    return offset;
+}
+
+/**
+ * Compute the disjunction of all the compressed start-stop matrix contained the parenthesis.
+ * @param trajectory The trajectory
+ * @param criteria The string of criteria
+ * @param cssm The compressed start-stop matrix
+ * @param offset The offset
+ * @return The new offset
+ */
+unsigned int
+parse_disjunction(const TSequence *trajectory, char *criteria, struct CSSM* cssm, unsigned int offset) { // Conjunctive normal form (and of or)
+    bool first = true;
+    struct CSSM temp;
+    bool negate = false;
+    struct c_token token;
+    offset = get_next_token(&token, criteria, offset);
+
+    while (token.type != close_t && token.type != eof_t) {
+        if (token.type == not_t) negate = true;
+
+        else if (token.type == function_t) {
+            char f = *token.value;
+            offset = get_next_token(&token, criteria, offset);
+            switch (f) {
+                case 's': temp = generate_CSSM_speed(trajectory, strtod(token.value, NULL)); break;
+                case 't': temp = generate_CSSM_time(trajectory, strtod(token.value, NULL)); break;
+                case 'd': temp = generate_CSSM_disk(trajectory, strtod(token.value, NULL)); break;
+                case 'a': temp = generate_CSSM_angular(trajectory, strtod(token.value, NULL)); break;
+                default: assert(false); break;
+            }
+            if (negate) {
+                negateCSSM(&temp);
+            }
+            if (first) {
+                cssm->blocks = temp.blocks;
+                cssm->n = temp.n;
+                first = false;
+            }
+            else {
+                disjunction_cssm(cssm, &temp);
+            }
+
+        }
+        offset = get_next_token(&token, criteria, offset);
+    }
+    if (token.type == eof_t) {
+        offset--;
+    }
+    return offset;
+}
+
+/**
+ * Compute the conjunction of all the compressed start-stop matrix computed.
+ * @param trajectory THe trajectory
+ * @param criteria The string of criteria
+ * @param cssm The compressed start-stop matrix
+ */
+void parse_conjunction(const TSequence *trajectory, char *criteria, struct CSSM* cssm) { // Conjunctive normal form (and of or)
+    bool first = true;
+    struct CSSM temp;
+    unsigned int offset = 0;
+    struct c_token token;
+    offset = get_next_token(&token, criteria, offset);
+
+    while (token.type != eof_t) {
+        if (token.type == open_t) {
+            offset = parse_disjunction(trajectory, criteria, &temp, offset);
+            if (first) {
+                cssm->blocks = temp.blocks;
+                cssm->n = temp.n;
+                first = false;
+            }
+            else {
+                conjunction_cssm(cssm, &temp);
+            }
+        }
+        offset = get_next_token(&token, criteria, offset);
+    }
+}
+
+/**
+ * Execute the stable criteria segmentation algorithm.
+ * @param temp The trajectory
+ * @param criteria The criteria
+ * @return An array of sub-trajectories
+ */
+ArrayType *
+temporal_segmentation_stable_criteria(const Temporal *temp, char *criteria) {
+    const TSequence *trajectory = (TSequence *) temp;
+
+    unsigned int length = trajectory->count;
+
+    struct CSSM cssm;
+
+    parse_conjunction(trajectory, criteria, &cssm);
+
+    struct segmentation_tree *t = compute_segmentation_tree(&cssm);
+
+    struct Segmentation segmentation;
+
+    segment_with_stable_criteria(&segmentation, t, length);
+
+    ArrayType *result = generate_sub_trajectories(trajectory, &segmentation);
+
+    pfree(segmentation.indices);
+
+    return result;
+}
+
 
 /*****************************************************************************
  * Mapbox Vector Tile functions for temporal points.

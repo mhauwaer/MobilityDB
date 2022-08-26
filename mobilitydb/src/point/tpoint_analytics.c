@@ -141,6 +141,58 @@ Tpoint_simplify(PG_FUNCTION_ARGS)
   PG_RETURN_POINTER(result);
 }
 
+
+PG_FUNCTION_INFO_V1(Tpoint_segmentation_sws_t);
+PGDLLEXPORT Datum
+Tpoint_segmentation_sws_t(PG_FUNCTION_ARGS)
+        {
+        Temporal *temp = PG_GETARG_TEMPORAL_P(0);
+        double eps = PG_GETARG_FLOAT8(1);
+        int window_length = PG_GETARG_INT32(2);
+        char kernel = PG_GETARG_CHAR(3);
+        ArrayType *result = temporal_segmentation_sws_threshold(temp, eps, window_length, kernel);
+        PG_FREE_IF_COPY(temp, 0);
+        PG_RETURN_POINTER(result);
+        }
+
+PG_FUNCTION_INFO_V1(Tpoint_segmentation_sws_p);
+PGDLLEXPORT Datum
+Tpoint_segmentation_sws_p(PG_FUNCTION_ARGS)
+        {
+        Temporal *temp = PG_GETARG_TEMPORAL_P(0);
+        double percentile = PG_GETARG_FLOAT8(1);
+        int window_length = PG_GETARG_INT32(2);
+        char kernel = PG_GETARG_CHAR(3);
+        ArrayType *result = temporal_segmentation_sws_percentile(temp, percentile, window_length, kernel);
+        PG_FREE_IF_COPY(temp, 0);
+        PG_RETURN_POINTER(result);
+        }
+
+PG_FUNCTION_INFO_V1(Tpoint_segmentation_stable_criteria);
+PGDLLEXPORT Datum
+Tpoint_segmentation_stable_criteria(PG_FUNCTION_ARGS)
+        {
+        Temporal *temp = PG_GETARG_TEMPORAL_P(0);
+        text *criteria = PG_GETARG_TEXT_P(1);
+        ArrayType *result = temporal_segmentation_stable_criteria(temp, text_to_cstring(criteria));
+        PG_FREE_IF_COPY(temp, 0);
+        PG_RETURN_POINTER(result);
+        }
+
+PG_FUNCTION_INFO_V1(Tpoint_segmentation_stop_points);
+PGDLLEXPORT Datum
+Tpoint_segmentation_stop_points(PG_FUNCTION_ARGS)
+        {
+        Temporal *temp = PG_GETARG_TEMPORAL_P(0);
+        double distance = PG_GETARG_FLOAT8(1);
+        double time = PG_GETARG_FLOAT8(2);
+        char criteria[100];
+        snprintf(criteria, sizeof(criteria), "(d[%f])(t[%f])", distance, time);
+        ArrayType *result = temporal_segmentation_stable_criteria(temp, criteria);
+        PG_FREE_IF_COPY(temp, 0);
+        PG_RETURN_POINTER(result);
+        }
+
 /*****************************************************************************
  * Mapbox Vector Tile functions for temporal points.
  *****************************************************************************/
