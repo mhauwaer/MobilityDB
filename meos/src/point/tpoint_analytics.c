@@ -2400,8 +2400,8 @@ disjunction_cssm(struct CSSM *a, struct CSSM *b) {
     struct Block **blocks = palloc(sizeof(struct Block*)*a->n);
 
     for (unsigned int i = 0; i < a->n; i++) {
-        struct Block *block_a = a->blocks[0];
-        struct Block *block_b = b->blocks[0];
+        struct Block *block_a = a->blocks[i];
+        struct Block *block_b = b->blocks[i];
         struct Block *last_block = NULL;
 
         blocks[i] = NULL;
