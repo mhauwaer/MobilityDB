@@ -1955,48 +1955,24 @@ struct CSSM {
  * @param cssm The compressed start-stop matrix
  */
 void negateCSSM(struct CSSM* cssm) {
-    struct Block **blocks = palloc(sizeof(struct Block*)*cssm->n);
-    for (unsigned int i = 0; i < cssm->n; i++) {
-        struct Block *current_block = cssm->blocks[i];
-        struct Block *last_block = NULL;
-        unsigned int start = 0;
-        unsigned int end = -1;
-        blocks[i] = NULL;
-
-        while (current_block!=NULL) {
-            end = current_block->start;
-
-            if (start != end) {
-                struct Block *new_block = palloc(sizeof(struct Block));
-                new_block->start = start;
-                new_block->end = end;
-                new_block->next = NULL;
-                start = current_block->end;
-
-                if (last_block == NULL) {
-                    blocks[i] = new_block;
-                }
-                else {
-                    last_block->next = new_block;
-                }
-                last_block = new_block;
-            }
-            current_block = current_block->next;
-        }
-        if (start < i) {
-            struct Block *new_block = palloc(sizeof(struct Block));
-            new_block->start = start;
-            new_block->end = i;
-            new_block->next = NULL;
-            if (last_block == NULL) {
-                blocks[i] = new_block;
-            }
-            else {
-                last_block->next = new_block;
-            }
-        }
-    }
-    cssm->blocks = blocks;
+      for (unsigned int i = 0; i < cssm->n; i++) {
+          struct Block *current_block = cssm->blocks[i];
+          if (current_block) {
+              if (current_block->start != 0) {
+                  current_block->end = current_block->start-1;
+                  current_block->start = 0;
+              }
+              else { // start == 0
+                  if (current_block->end != i) {
+                      current_block->start = current_block->end + 1;
+                      current_block->end = i;
+                  }
+                  else { // end = i
+                      cssm->blocks[i] = NULL;
+                  }
+              }
+          }
+      }
 }
 
 /**
@@ -2017,7 +1993,7 @@ struct CSSM generate_CSSM_time(const TSequence *trajectory, double time) {
       }
       struct Block *block = palloc(sizeof(struct Block));
       assert(block);
-      block->start = i;
+      block->start = ((i>=0) ? (i):(0));
       block->end = j;
       block->next = NULL;
       cssm.blocks[j] = block;
@@ -2382,7 +2358,7 @@ conjunction_cssm(struct CSSM *a, struct CSSM *b) {
                 block_a = block_a->next;
             }
             else {
-                block_a = block_b->next;
+                block_b = block_b->next;
             }
         }
     }
